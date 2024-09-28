@@ -30,9 +30,10 @@ import android.annotation.TargetApi;
 import android.app.Activity;
 import android.app.Application;
 import android.app.Notification;
+import android.app.NotificationChannel;
 import android.app.NotificationManager;
-import android.app.Service;
 import android.app.PendingIntent;
+import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
 import android.net.Uri;
@@ -45,6 +46,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.net.IDN;
 import java.security.cert.*;
 import java.security.KeyStore;
 import java.security.KeyStoreException;
@@ -90,6 +92,7 @@ public class MemorizingTrustManager implements X509TrustManager {
 	Context master;
 	Activity foregroundAct;
 	NotificationManager notificationManager;
+	private static final String CHANNEL_ID = "memorizingtrustmanager";
 	private static int decisionId = 0;
 	private static SparseArray<MTMDecision> openDecisions = new SparseArray<MTMDecision>();
 
@@ -140,7 +143,19 @@ public class MemorizingTrustManager implements X509TrustManager {
 		master = m;
 		masterHandler = new Handler(m.getMainLooper());
 		notificationManager = (NotificationManager)master.getSystemService(Context.NOTIFICATION_SERVICE);
-
+		if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+			NotificationChannel channel = notificationManager.getNotificationChannel(CHANNEL_ID);
+			if (channel == null) {
+				channel = new NotificationChannel(CHANNEL_ID,
+						m.getString(R.string.mtm_notification_channel),
+						NotificationManager.IMPORTANCE_DEFAULT);
+				channel.setDescription(m.getString(R.string.mtm_notification));
+				channel.enableLights(true);
+				channel.enableVibration(true);
+				channel.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
+				notificationManager.createNotificationChannel(channel);
+			}
+		}
 		Application app;
 		if (m instanceof Application) {
 			app = (Application)m;
@@ -419,11 +434,6 @@ public class MemorizingTrustManager implements X509TrustManager {
 				appTrustManager.checkClientTrusted(chain, authType);
 		} catch (CertificateException ae) {
 			LOGGER.log(Level.FINER, "checkCertTrusted: appTrustManager did not verify certificate. Will fall back to secondary verification mechanisms (if any).", ae);
-			// if the cert is stored in our appTrustManager, we ignore expiredness
-			if (isExpiredException(ae)) {
-				LOGGER.log(Level.INFO, "checkCertTrusted: accepting expired certificate from keystore");
-				return;
-			}
 			if (isCertKnown(chain[0])) {
 				LOGGER.log(Level.INFO, "checkCertTrusted: accepting cert already stored in keystore");
 				return;
@@ -495,10 +505,38 @@ public class MemorizingTrustManager implements X509TrustManager {
 		}
 	}
 
-	private static void certDetails(StringBuilder si, X509Certificate c) {
+	private void certDetails(StringBuilder si, X509Certificate c) {
 		SimpleDateFormat validityDateFormater = new SimpleDateFormat("yyyy-MM-dd");
 		si.append("\n");
-		si.append(c.getSubjectDN().toString());
+		si.append(master.getString(R.string.mtm_valid_for));
+		si.append("\n");
+		try {
+			Collection<List<?>> sans = c.getSubjectAlternativeNames();
+			if (sans == null) {
+				si.append(c.getSubjectDN());
+				si.append("\n");
+			} else for (List<?> altName : sans) {
+				Object name = altName.get(1);
+				if (name instanceof String) {
+					si.append("[");
+					si.append(altName.get(0));
+					si.append("] ");
+					si.append(name);
+					String idn = IDN.toUnicode((String)name, IDN.ALLOW_UNASSIGNED);
+					if (!name.equals(idn)) {
+						si.append(" (").append(idn).append(")");
+					}
+					si.append("\n");
+				}
+			}
+		} catch (CertificateParsingException e) {
+			e.printStackTrace();
+			si.append("<Parsing error: ");
+			si.append(e.getLocalizedMessage());
+			si.append(">\n");
+		}
+		si.append("\n");
+		si.append(master.getString(R.string.mtm_cert_details));
 		si.append("\n");
 		si.append(validityDateFormater.format(c.getNotBefore()));
 		si.append(" - ");
@@ -527,9 +565,8 @@ public class MemorizingTrustManager implements X509TrustManager {
 			si.append(e.getLocalizedMessage());
 		}
 		si.append("\n\n");
-		si.append(master.getString(R.string.mtm_connect_anyway));
+		si.append(master.getString(R.string.mtm_trust_certificate));
 		si.append("\n\n");
-		si.append(master.getString(R.string.mtm_cert_details));
 		for (X509Certificate c : chain) {
 			certDetails(si, c);
 		}
@@ -541,31 +578,8 @@ public class MemorizingTrustManager implements X509TrustManager {
 
 		si.append(master.getString(R.string.mtm_hostname_mismatch, hostname));
 		si.append("\n\n");
-		try {
-			Collection<List<?>> sans = cert.getSubjectAlternativeNames();
-			if (sans == null) {
-				si.append(cert.getSubjectDN());
-				si.append("\n");
-			} else for (List<?> altName : sans) {
-				Object name = altName.get(1);
-				if (name instanceof String) {
-					si.append("[");
-					si.append(altName.get(0));
-					si.append("] ");
-					si.append(name);
-					si.append("\n");
-				}
-			}
-		} catch (CertificateParsingException e) {
-			e.printStackTrace();
-			si.append("<Parsing error: ");
-			si.append(e.getLocalizedMessage());
-			si.append(">\n");
-		}
-		si.append("\n");
-		si.append(master.getString(R.string.mtm_connect_anyway));
+		si.append(master.getString(R.string.mtm_accept_servername));
 		si.append("\n\n");
-		si.append(master.getString(R.string.mtm_cert_details));
 		certDetails(si, cert);
 		return si.toString();
 	}
@@ -623,7 +637,10 @@ public class MemorizingTrustManager implements X509TrustManager {
 			n.flags |= Notification.FLAG_AUTO_CANCEL;
 			notification = n;
 		} else {
-			notification = new Notification.Builder(master)
+			Notification.Builder notificationBuilder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O ?
+					new Notification.Builder(master, CHANNEL_ID)
+					: new Notification.Builder(master);
+			notification = notificationBuilder
 					.setContentTitle(mtmNotification)
 					.setContentText(certName)
 					.setTicker(certName)
@@ -687,7 +704,7 @@ public class MemorizingTrustManager implements X509TrustManager {
 	void interactCert(final X509Certificate[] chain, String authType, CertificateException cause)
 			throws CertificateException
 	{
-		switch (interact(certChainMessage(chain, cause), R.string.mtm_accept_cert)) {
+		switch (interact(certChainMessage(chain, cause), R.string.mtm_security_risk)) {
 		case MTMDecision.DECISION_ALWAYS:
 			storeCert(chain[0]); // only store the server cert, not the whole chain
 		case MTMDecision.DECISION_ONCE:
@@ -699,7 +716,7 @@ public class MemorizingTrustManager implements X509TrustManager {
 
 	boolean interactHostname(X509Certificate cert, String hostname)
 	{
-		switch (interact(hostNameMessage(cert, hostname), R.string.mtm_accept_servername)) {
+		switch (interact(hostNameMessage(cert, hostname), R.string.mtm_security_risk)) {
 		case MTMDecision.DECISION_ALWAYS:
 			storeCert(hostname, cert);
 		case MTMDecision.DECISION_ONCE:
